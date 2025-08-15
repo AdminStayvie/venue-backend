@@ -1,4 +1,4 @@
-// migrate.js (Versi Final - Paling Tangguh)
+// migrate.js (Versi Final - Dengan Diagnostik)
 require('dotenv').config();
 const { MongoClient, ObjectId } = require('mongodb');
 const fs = require('fs');
@@ -22,8 +22,9 @@ function readCsv(filePath) {
         if (!fs.existsSync(filePath)) {
             return reject(new Error(`File tidak ditemukan: ${filePath}`));
         }
+        // Menambahkan opsi untuk menangani quote dan spasi
         fs.createReadStream(filePath)
-            .pipe(csv())
+            .pipe(csv({ mapHeaders: ({ header }) => header.trim() }))
             .on('data', (data) => results.push(data))
             .on('end', () => resolve(results))
             .on('error', (error) => reject(error));
@@ -96,7 +97,7 @@ function parseDate(dateStr) {
 
 async function migrate() {
     try {
-        console.log("🚀 Memulai proses migrasi data (versi final)...");
+        console.log("🚀 Memulai proses migrasi data (versi final dengan diagnostik)...");
 
         const [reservationsData, addonsData, paymentsData] = await Promise.all([
             readReservationsCsvSmart(path.join(__dirname, 'reservations.csv')),
@@ -162,6 +163,22 @@ async function migrate() {
                     createdAt: new Date()
                 });
                 addonsMatched++;
+            } else if (inv === 'INV/2025/02-VE-0005') {
+                // --- BAGIAN DIAGNOSTIK ---
+                console.log("\n--- DIAGNOSTIK UNTUK INV/2025/02-VE-0005 ---");
+                console.log(`Mencoba mencocokkan addon dengan INV: '${inv}'`);
+                console.log(`Apakah kunci ini ada di Map Reservasi? -> ${reservationsMap.has(inv)}`);
+                const keysInMap = Array.from(reservationsMap.keys());
+                const matchingKey = keysInMap.find(k => k.includes('2025/02-VE-0005'));
+                if (matchingKey) {
+                    console.log(`Ditemukan kunci yang mirip di Map Reservasi: '${matchingKey}'`);
+                    console.log(`Panjang string dari addons.csv: ${inv.length}`);
+                    console.log(`Panjang string dari reservations.csv: ${matchingKey.length}`);
+                } else {
+                    console.log("Tidak ditemukan kunci yang mirip sama sekali di Map Reservasi.");
+                }
+                console.log("--- AKHIR DIAGNOSTIK ---\n");
+                // --- AKHIR BAGIAN DIAGNOSTIK ---
             }
         }
 
