@@ -3,6 +3,9 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { MongoClient, ObjectId } = require('mongodb');
+const multer = require('multer');
+const ExcelJS = require('exceljs');
+const stream = require('stream');
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -12,6 +15,9 @@ const dbName = process.env.DB_NAME || 'venueDB';
 // Middleware
 app.use(cors());
 app.use(express.json());
+
+// Konfigurasi Multer untuk upload file di memori
+const upload = multer({ storage: multer.memoryStorage() });
 
 // Validasi variabel lingkungan
 if (!mongoUri) {
@@ -31,7 +37,7 @@ async function connectDB() {
         console.log(`Terhubung ke MongoDB, database: ${dbName}`);
     } catch (e) {
         console.error("Gagal terhubung ke MongoDB", e);
-        process.exit(1); // Keluar dari aplikasi jika koneksi DB gagal
+        process.exit(1);
     }
 }
 
@@ -42,46 +48,86 @@ app.get('/api', (req, res) => {
     res.json({ status: 'API is running', timestamp: new Date() });
 });
 
-// GET: Mengambil semua data reservasi
+// GET: Mengambil semua data reservasi dengan filter, sort, dan paginasi
 app.get('/api/reservations', async (req, res) => {
     try {
-        // Hanya kirim field yang dibutuhkan oleh kalender untuk efisiensi
-        const projection = { 
-            nomorInvoice: 1, 
-            tanggalEvent: 1, 
-            namaClient: 1, 
-            venue: 1, 
-            kategoriEvent: 1,
-            waktuEvent: 1,
-            namaSales: 1,
-            pax: 1,
-            subTotal: 1,
-            pembayaran: 1,
-            addons: 1,
-            dibatalkan: 1
-        };
-        const reservations = await reservationsCollection.find({}).project(projection).toArray();
-        res.json(reservations);
+        const { search = '', page = 1, limit = 10, sort = 'tanggalEvent', order = 'desc' } = req.query;
+        const query = search ? { namaClient: { $regex: search, $options: 'i' } } : {};
+        const sortOrder = order === 'asc' ? 1 : -1;
+        
+        const reservations = await reservationsCollection
+            .find(query)
+            .sort({ [sort]: sortOrder })
+            .skip((page - 1) * limit)
+            .limit(parseInt(limit))
+            .toArray();
+
+        const total = await reservationsCollection.countDocuments(query);
+
+        res.json({
+            data: reservations,
+            total,
+            page: parseInt(page),
+            limit: parseInt(limit),
+            totalPages: Math.ceil(total / limit)
+        });
     } catch (e) {
         res.status(500).json({ message: "Gagal mengambil data reservasi", error: e.message });
     }
 });
+
+// POST: Membuat reservasi baru
+app.post('/api/reservations', async (req, res) => {
+    try {
+        const newData = req.body;
+
+        // Generate Nomor Invoice Otomatis
+        const now = new Date();
+        const year = now.getFullYear();
+        const month = String(now.getMonth() + 1).padStart(2, '0');
+        const count = await reservationsCollection.countDocuments();
+        const nextId = String(count + 1).padStart(4, '0');
+        const nomorInvoice = `INV/${year}/${month}-VE-${nextId}`;
+
+        const reservation = {
+            nomorInvoice,
+            ...newData,
+            tanggalReservasi: new Date(newData.tanggalReservasi),
+            tanggalEvent: new Date(newData.tanggalEvent),
+            pax: parseInt(newData.pax),
+            hargaPerPax: parseFloat(newData.hargaPerPax),
+            subTotal: parseFloat(newData.subTotal),
+            dp: parseFloat(newData.dp),
+            dibatalkan: false,
+            pembayaran: [],
+            addons: [],
+            createdAt: new Date(),
+            updatedAt: new Date(),
+        };
+
+        const result = await reservationsCollection.insertOne(reservation);
+        res.status(201).json({ message: "Reservasi berhasil dibuat", data: result });
+    } catch (e) {
+        res.status(500).json({ message: "Gagal membuat reservasi", error: e.message });
+    }
+});
+
 
 // POST: Menambah item add-on baru
 app.post('/api/reservations/:invoice/addons', async (req, res) => {
     const { invoice } = req.params;
     const { item, pax, hargaPerPax, subTotal, catatan } = req.body;
 
-    if (!item || !pax || !hargaPerPax || !subTotal) {
+    if (!item || pax === undefined || hargaPerPax === undefined || subTotal === undefined) {
         return res.status(400).json({ message: "Data add-on tidak lengkap." });
     }
 
     const newAddon = {
-        _id: new ObjectId(), // ID unik baru
+        _id: new ObjectId(),
         item,
-        pax,
-        hargaPerPax,
-        subTotal,
+        pax: parseInt(pax),
+        hargaPerPax: parseFloat(hargaPerPax),
+        subTotal: parseFloat(subTotal),
         catatan: catatan || "",
         createdAt: new Date()
     };
@@ -94,9 +140,7 @@ app.post('/api/reservations/:invoice/addons', async (req, res) => {
                 $set: { updatedAt: new Date() }
             }
         );
-        if (result.matchedCount === 0) {
-            return res.status(404).json({ message: `Invoice ${invoice} tidak ditemukan.` });
-        }
+        if (result.matchedCount === 0) return res.status(404).json({ message: `Invoice ${invoice} tidak ditemukan.` });
         res.status(201).json({ message: "Add-on berhasil ditambahkan", data: newAddon });
     } catch (e) {
         res.status(500).json({ message: "Gagal menambah add-on", error: e.message });
@@ -127,12 +171,92 @@ app.post('/api/reservations/:invoice/pembayaran', async (req, res) => {
                 $set: { updatedAt: new Date() }
             }
         );
-        if (result.matchedCount === 0) {
-            return res.status(404).json({ message: `Invoice ${invoice} tidak ditemukan.` });
-        }
+        if (result.matchedCount === 0) return res.status(404).json({ message: `Invoice ${invoice} tidak ditemukan.` });
         res.status(201).json({ message: "Pembayaran berhasil ditambahkan", data: newPayment });
     } catch (e) {
         res.status(500).json({ message: "Gagal menambah pembayaran", error: e.message });
+    }
+});
+
+// GET: Export data reservasi ke Excel
+app.get('/api/reservations/export', async (req, res) => {
+    try {
+        const workbook = new ExcelJS.Workbook();
+        const worksheet = workbook.addWorksheet('Reservations');
+        
+        // Definisikan header kolom
+        worksheet.columns = [
+            { header: 'Nomor Invoice', key: 'nomorInvoice', width: 25 },
+            { header: 'Tanggal Reservasi', key: 'tanggalReservasi', width: 15 },
+            { header: 'Tanggal Event', key: 'tanggalEvent', width: 15 },
+            { header: 'Nama Client', key: 'namaClient', width: 20 },
+            { header: 'Venue', key: 'venue', width: 15 },
+            { header: 'Kategori Event', key: 'kategoriEvent', width: 15 },
+            { header: 'Nama Sales', key: 'namaSales', width: 15 },
+            { header: 'Pax', key: 'pax', width: 10 },
+            { header: 'Sub Total', key: 'subTotal', width: 15, style: { numFmt: '"Rp"#,##0' } },
+            { header: 'DP', key: 'dp', width: 15, style: { numFmt: '"Rp"#,##0' } },
+            { header: 'Dibatalkan', key: 'dibatalkan', width: 12 },
+        ];
+
+        const reservations = await reservationsCollection.find({}).toArray();
+        worksheet.addRows(reservations);
+
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', 'attachment; filename="reservations.xlsx"');
+
+        const buffer = await workbook.xlsx.writeBuffer();
+        res.send(buffer);
+
+    } catch (e) {
+        res.status(500).json({ message: "Gagal mengekspor data", error: e.message });
+    }
+});
+
+// POST: Import data dari Excel
+app.post('/api/reservations/import', upload.single('file'), async (req, res) => {
+    if (!req.file) {
+        return res.status(400).send('Tidak ada file yang diunggah.');
+    }
+
+    try {
+        const workbook = new ExcelJS.Workbook();
+        const buffer = req.file.buffer;
+        await workbook.xlsx.load(buffer);
+        
+        const worksheet = workbook.getWorksheet(1);
+        const reservationsToInsert = [];
+        
+        worksheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
+            if (rowNumber === 1) return; // Skip header row
+
+            reservationsToInsert.push({
+                nomorInvoice: row.getCell('A').value,
+                tanggalReservasi: new Date(row.getCell('B').value),
+                tanggalEvent: new Date(row.getCell('C').value),
+                namaClient: row.getCell('D').value,
+                venue: row.getCell('E').value,
+                kategoriEvent: row.getCell('F').value,
+                namaSales: row.getCell('G').value,
+                pax: parseInt(row.getCell('H').value),
+                subTotal: parseFloat(row.getCell('I').value),
+                dp: parseFloat(row.getCell('J').value),
+                dibatalkan: row.getCell('K').value === 'TRUE' || row.getCell('K').value === true,
+                pembayaran: [],
+                addons: [],
+                createdAt: new Date(),
+                updatedAt: new Date(),
+            });
+        });
+
+        if (reservationsToInsert.length > 0) {
+            await reservationsCollection.insertMany(reservationsToInsert, { ordered: false });
+        }
+        
+        res.status(201).json({ message: `${reservationsToInsert.length} data berhasil diimpor.` });
+
+    } catch (e) {
+        res.status(500).json({ message: "Gagal mengimpor data", error: e.message });
     }
 });
 
