@@ -1,4 +1,4 @@
-// migrate.js
+// migrate.js (Versi Cerdas untuk menangani CSV multi-baris)
 require('dotenv').config();
 const { MongoClient, ObjectId } = require('mongodb');
 const fs = require('fs');
@@ -15,7 +15,7 @@ if (!mongoUri) {
 
 const client = new MongoClient(mongoUri);
 
-// Fungsi untuk membaca file CSV dan mengembalikan data sebagai Promise
+// Fungsi untuk membaca CSV biasa (untuk addons dan payments)
 function readCsv(filePath) {
     return new Promise((resolve, reject) => {
         const results = [];
@@ -30,17 +30,67 @@ function readCsv(filePath) {
     });
 }
 
-// Fungsi untuk membersihkan format mata uang (misal: "Rp 1.500.000") menjadi angka
+// Fungsi KHUSUS untuk membaca reservations.csv yang formatnya tidak standar
+function readReservationsCsvSmart(filePath) {
+    return new Promise((resolve, reject) => {
+        if (!fs.existsSync(filePath)) {
+            return reject(new Error(`File tidak ditemukan: ${filePath}`));
+        }
+        const fileContent = fs.readFileSync(filePath, 'utf8');
+        const lines = fileContent.split('\n');
+        const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, ''));
+        const data = [];
+        let currentRecord = null;
+
+        for (let i = 1; i < lines.length; i++) {
+            const line = lines[i].trim();
+            if (!line) continue;
+
+            // Regex untuk mendeteksi baris yang dimulai dengan format Invoice
+            const invoiceRegex = /^"INV\/\d{4}\/\d{2}-VE-\d{4}/;
+
+            if (invoiceRegex.test(line)) {
+                // Jika ini baris baru, simpan record sebelumnya (jika ada)
+                if (currentRecord) {
+                    data.push(currentRecord);
+                }
+                // Mulai record baru
+                const values = line.split(',');
+                currentRecord = {};
+                headers.forEach((header, index) => {
+                    currentRecord[header] = (values[index] || '').replace(/"/g, '');
+                });
+            } else if (currentRecord) {
+                // Jika bukan baris baru, gabungkan ke kolom 'Catatan' dari record sebelumnya
+                currentRecord['Catatan'] = (currentRecord['Catatan'] || '') + ' ' + line.replace(/"/g, '');
+            }
+        }
+        // Simpan record terakhir
+        if (currentRecord) {
+            data.push(currentRecord);
+        }
+        resolve(data);
+    });
+}
+
+
+// Fungsi utilitas lainnya (parseCurrency, parseDate)
 function parseCurrency(value) {
     if (typeof value !== 'string' || !value) return 0;
-    // Menghapus semua karakter kecuali angka dan koma, lalu mengganti koma dengan titik
     return parseFloat(value.replace(/[^0-9,]+/g, "").replace(",", ".")) || 0;
 }
 
-// Fungsi untuk mengubah berbagai format tanggal menjadi objek Date yang valid
 function parseDate(dateStr) {
-    if (!dateStr) return null;
-    // Coba beberapa format umum, misal: 'DD-Mon-YYYY' (15-Jun-2025) atau 'YYYY-MM-DD'
+    if (!dateStr || dateStr.trim() === '') return null;
+    try {
+        // Mencoba format "DD MMMM YYYY" seperti "03 Mei 2025"
+        const months = { 'januari': 0, 'februari': 1, 'maret': 2, 'april': 3, 'mei': 4, 'juni': 5, 'juli': 6, 'agustus': 7, 'september': 8, 'oktober': 9, 'november': 10, 'desember': 11 };
+        const parts = dateStr.toLowerCase().split(' ');
+        if (parts.length === 3 && months[parts[1]] !== undefined) {
+            return new Date(parts[2], months[parts[1]], parts[0]);
+        }
+    } catch (e) { /* Lanjut ke parser berikutnya */ }
+
     const date = new Date(dateStr);
     if (!isNaN(date.getTime())) {
         return date;
@@ -49,28 +99,27 @@ function parseDate(dateStr) {
     return new Date();
 }
 
+
 async function migrate() {
     try {
-        console.log("🚀 Memulai proses migrasi data...");
+        console.log("🚀 Memulai proses migrasi data (dengan mode cerdas)...");
 
-        // 1. Membaca semua data dari file CSV
         const [reservationsData, addonsData, paymentsData] = await Promise.all([
-            readCsv(path.join(__dirname, 'reservations.csv')),
+            readReservationsCsvSmart(path.join(__dirname, 'reservations.csv')),
             readCsv(path.join(__dirname, 'addons.csv')),
             readCsv(path.join(__dirname, 'payments.csv'))
         ]);
-        console.log(`✅ Data CSV berhasil dibaca:`);
-        console.log(`   - ${reservationsData.length} data reservasi`);
+        
+        console.log(`📊 Data CSV berhasil dibaca:`);
+        console.log(`   - ${reservationsData.length} data reservasi (setelah digabungkan)`);
         console.log(`   - ${addonsData.length} data add-ons`);
         console.log(`   - ${paymentsData.length} data pembayaran`);
 
-        // 2. Menggabungkan data menjadi satu struktur dokumen
         const reservationsMap = new Map();
 
-        // Proses data reservasi utama
         for (const row of reservationsData) {
             const inv = row['Nomor Invoice'];
-            if (inv) {
+            if (inv && inv.trim() !== '') {
                 reservationsMap.set(inv, {
                     _id: new ObjectId(),
                     nomorInvoice: inv,
@@ -89,7 +138,7 @@ async function migrate() {
                     subTotal: parseCurrency(row['Sub Total']),
                     dp: parseCurrency(row['DP']),
                     buktiDpUrl: row['Bukti DP'] || '',
-                    catatan: row['Catatan'] || '',
+                    catatan: (row['Catatan'] || '').trim(),
                     dibatalkan: row['Batal'] === 'TRUE' || row['Batal'] === true,
                     pembayaran: [],
                     addons: [],
@@ -99,9 +148,8 @@ async function migrate() {
             }
         }
 
-        // Proses dan sematkan data add-ons
         for (const row of addonsData) {
-            const inv = row['No INV']; // Sesuaikan dengan nama kolom di CSV Anda
+            const inv = row['No INV'];
             if (reservationsMap.has(inv)) {
                 const pax = parseInt(row['#Jumlah PAX']) || 0;
                 const harga = parseCurrency(row['#Harga/Pax']);
@@ -117,9 +165,8 @@ async function migrate() {
             }
         }
 
-        // Proses dan sematkan data pembayaran
         for (const row of paymentsData) {
-            const inv = row['INV']; // Sesuaikan dengan nama kolom di CSV Anda
+            const inv = row['INV'];
             if (reservationsMap.has(inv)) {
                 reservationsMap.get(inv).pembayaran.push({
                     _id: new ObjectId(),
@@ -131,19 +178,16 @@ async function migrate() {
             }
         }
 
-        // 3. Memasukkan data ke MongoDB
         await client.connect();
         console.log("🔗 Terhubung ke MongoDB...");
         const database = client.db(dbName);
         const collection = database.collection('reservations');
         
-        // Opsi: Hapus semua data lama sebelum memasukkan yang baru
-        // Hati-hati menggunakan ini! Hanya aktifkan jika Anda yakin ingin memulai dari awal.
-        // await collection.deleteMany({});
-        // console.log("🗑️  Collection 'reservations' lama telah dibersihkan.");
-
         const finalData = Array.from(reservationsMap.values());
         if (finalData.length > 0) {
+            await collection.deleteMany({});
+            console.log("🗑️  Collection 'reservations' lama telah dibersihkan.");
+            
             const result = await collection.insertMany(finalData);
             console.log(`🎉 Migrasi SUKSES! ${result.insertedCount} dokumen berhasil dimasukkan.`);
         } else {
@@ -158,5 +202,4 @@ async function migrate() {
     }
 }
 
-// Jalankan fungsi migrasi
 migrate();
