@@ -1,11 +1,10 @@
-// index.js
+// index.js (Dengan Fitur Lengkap: CRUD, Sort, Search Lanjutan)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { MongoClient, ObjectId } = require('mongodb');
 const multer = require('multer');
 const ExcelJS = require('exceljs');
-const stream = require('stream');
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -15,17 +14,13 @@ const dbName = process.env.DB_NAME || 'venueDB';
 // Middleware
 app.use(cors());
 app.use(express.json());
-
-// Konfigurasi Multer untuk upload file di memori
 const upload = multer({ storage: multer.memoryStorage() });
 
-// Validasi variabel lingkungan
 if (!mongoUri) {
     console.error("Error: MONGO_URI tidak ditemukan di file .env");
     process.exit(1);
 }
 
-// Koneksi ke MongoDB
 const client = new MongoClient(mongoUri);
 let reservationsCollection;
 
@@ -43,16 +38,26 @@ async function connectDB() {
 
 // === API Endpoints ===
 
-// Health Check
-app.get('/api', (req, res) => {
-    res.json({ status: 'API is running', timestamp: new Date() });
-});
-
-// GET: Mengambil semua data reservasi dengan filter, sort, dan paginasi
+// GET: Mengambil data reservasi (dengan pencarian, sort, paginasi)
 app.get('/api/reservations', async (req, res) => {
     try {
-        const { search = '', page = 1, limit = 10, sort = 'tanggalEvent', order = 'desc' } = req.query;
-        const query = search ? { namaClient: { $regex: search, $options: 'i' } } : {};
+        const { search = '', searchBy = 'namaClient', page = 1, limit = 10, sort = 'tanggalEvent', order = 'desc' } = req.query;
+        
+        let query = {};
+        if (search) {
+            // Jika searchBy adalah tanggal, kita perlu query rentang
+            if (searchBy === 'tanggalEvent') {
+                const searchDate = new Date(search);
+                if (!isNaN(searchDate.getTime())) {
+                    const startOfDay = new Date(searchDate.setHours(0, 0, 0, 0));
+                    const endOfDay = new Date(searchDate.setHours(23, 59, 59, 999));
+                    query[searchBy] = { $gte: startOfDay, $lte: endOfDay };
+                }
+            } else {
+                query[searchBy] = { $regex: search, $options: 'i' };
+            }
+        }
+        
         const sortOrder = order === 'asc' ? 1 : -1;
         
         const reservations = await reservationsCollection
@@ -76,12 +81,27 @@ app.get('/api/reservations', async (req, res) => {
     }
 });
 
+// GET: Mengambil satu data reservasi berdasarkan ID
+app.get('/api/reservations/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).json({ message: "ID tidak valid" });
+        }
+        const reservation = await reservationsCollection.findOne({ _id: new ObjectId(id) });
+        if (!reservation) {
+            return res.status(404).json({ message: "Reservasi tidak ditemukan" });
+        }
+        res.json(reservation);
+    } catch (e) {
+        res.status(500).json({ message: "Gagal mengambil data", error: e.message });
+    }
+});
+
 // POST: Membuat reservasi baru
 app.post('/api/reservations', async (req, res) => {
     try {
         const newData = req.body;
-
-        // Generate Nomor Invoice Otomatis
         const now = new Date();
         const year = now.getFullYear();
         const month = String(now.getMonth() + 1).padStart(2, '0');
@@ -90,6 +110,7 @@ app.post('/api/reservations', async (req, res) => {
         const nomorInvoice = `INV/${year}/${month}-VE-${nextId}`;
 
         const reservation = {
+            _id: new ObjectId(),
             nomorInvoice,
             ...newData,
             tanggalReservasi: new Date(newData.tanggalReservasi),
@@ -104,7 +125,6 @@ app.post('/api/reservations', async (req, res) => {
             createdAt: new Date(),
             updatedAt: new Date(),
         };
-
         const result = await reservationsCollection.insertOne(reservation);
         res.status(201).json({ message: "Reservasi berhasil dibuat", data: result });
     } catch (e) {
@@ -112,70 +132,93 @@ app.post('/api/reservations', async (req, res) => {
     }
 });
 
-
-// POST: Menambah item add-on baru
-app.post('/api/reservations/:invoice/addons', async (req, res) => {
-    const { invoice } = req.params;
-    const { item, pax, hargaPerPax, subTotal, catatan } = req.body;
-
-    if (!item || pax === undefined || hargaPerPax === undefined || subTotal === undefined) {
-        return res.status(400).json({ message: "Data add-on tidak lengkap." });
-    }
-
-    const newAddon = {
-        _id: new ObjectId(),
-        item,
-        pax: parseInt(pax),
-        hargaPerPax: parseFloat(hargaPerPax),
-        subTotal: parseFloat(subTotal),
-        catatan: catatan || "",
-        createdAt: new Date()
-    };
-    
+// PUT: Mengupdate reservasi berdasarkan ID
+app.put('/api/reservations/:id', async (req, res) => {
     try {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).json({ message: "ID tidak valid" });
+        }
+        const { _id, nomorInvoice, ...updateData } = req.body;
+        
+        updateData.tanggalReservasi = new Date(updateData.tanggalReservasi);
+        updateData.tanggalEvent = new Date(updateData.tanggalEvent);
+        updateData.pax = parseInt(updateData.pax);
+        updateData.hargaPerPax = parseFloat(updateData.hargaPerPax);
+        updateData.subTotal = parseFloat(updateData.subTotal);
+        updateData.dp = parseFloat(updateData.dp);
+        updateData.updatedAt = new Date();
+
         const result = await reservationsCollection.updateOne(
-            { nomorInvoice: invoice },
-            { 
-                $push: { addons: newAddon },
-                $set: { updatedAt: new Date() }
-            }
+            { _id: new ObjectId(id) },
+            { $set: updateData }
         );
-        if (result.matchedCount === 0) return res.status(404).json({ message: `Invoice ${invoice} tidak ditemukan.` });
-        res.status(201).json({ message: "Add-on berhasil ditambahkan", data: newAddon });
+
+        if (result.matchedCount === 0) {
+            return res.status(404).json({ message: "Reservasi tidak ditemukan" });
+        }
+        res.json({ message: "Reservasi berhasil diperbarui" });
     } catch (e) {
-        res.status(500).json({ message: "Gagal menambah add-on", error: e.message });
+        res.status(500).json({ message: "Gagal memperbarui reservasi", error: e.message });
     }
 });
 
-// POST: Menambah pembayaran baru
-app.post('/api/reservations/:invoice/pembayaran', async (req, res) => {
-    const { invoice } = req.params;
-    const { jumlah, tanggal } = req.body;
-
-    if (!jumlah || !tanggal) {
-        return res.status(400).json({ message: "Jumlah dan tanggal pembayaran harus diisi." });
+// DELETE: Menghapus reservasi berdasarkan ID
+app.delete('/api/reservations/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).json({ message: "ID tidak valid" });
+        }
+        const result = await reservationsCollection.deleteOne({ _id: new ObjectId(id) });
+        if (result.deletedCount === 0) {
+            return res.status(404).json({ message: "Reservasi tidak ditemukan" });
+        }
+        res.json({ message: "Reservasi berhasil dihapus" });
+    } catch (e) {
+        res.status(500).json({ message: "Gagal menghapus reservasi", error: e.message });
     }
+});
 
-    const newPayment = {
-        _id: new ObjectId(),
-        jumlah: parseFloat(jumlah),
-        tanggal: new Date(tanggal),
-        createdAt: new Date()
+// POST: Menambah item add-on baru
+app.post('/api/reservations/:id/addons', async (req, res) => {
+    const { id } = req.params;
+    const { item, pax, hargaPerPax, subTotal, catatan } = req.body;
+    if (!ObjectId.isValid(id)) return res.status(400).json({ message: "ID tidak valid" });
+    if (!item || pax === undefined || hargaPerPax === undefined || subTotal === undefined) {
+        return res.status(400).json({ message: "Data add-on tidak lengkap." });
+    }
+    const newAddon = {
+        _id: new ObjectId(), item, pax: parseInt(pax), hargaPerPax: parseFloat(hargaPerPax),
+        subTotal: parseFloat(subTotal), catatan: catatan || "", createdAt: new Date()
     };
-
     try {
         const result = await reservationsCollection.updateOne(
-            { nomorInvoice: invoice },
-            { 
-                $push: { pembayaran: newPayment },
-                $set: { updatedAt: new Date() }
-            }
+            { _id: new ObjectId(id) },
+            { $push: { addons: newAddon }, $set: { updatedAt: new Date() } }
         );
-        if (result.matchedCount === 0) return res.status(404).json({ message: `Invoice ${invoice} tidak ditemukan.` });
+        if (result.matchedCount === 0) return res.status(404).json({ message: `Reservasi tidak ditemukan.` });
+        res.status(201).json({ message: "Add-on berhasil ditambahkan", data: newAddon });
+    } catch (e) { res.status(500).json({ message: "Gagal menambah add-on", error: e.message }); }
+});
+
+// POST: Menambah pembayaran baru
+app.post('/api/reservations/:id/pembayaran', async (req, res) => {
+    const { id } = req.params;
+    const { jumlah, tanggal } = req.body;
+    if (!ObjectId.isValid(id)) return res.status(400).json({ message: "ID tidak valid" });
+    if (!jumlah || !tanggal) return res.status(400).json({ message: "Jumlah dan tanggal pembayaran harus diisi." });
+    const newPayment = {
+        _id: new ObjectId(), jumlah: parseFloat(jumlah), tanggal: new Date(tanggal), createdAt: new Date()
+    };
+    try {
+        const result = await reservationsCollection.updateOne(
+            { _id: new ObjectId(id) },
+            { $push: { pembayaran: newPayment }, $set: { updatedAt: new Date() } }
+        );
+        if (result.matchedCount === 0) return res.status(404).json({ message: `Reservasi tidak ditemukan.` });
         res.status(201).json({ message: "Pembayaran berhasil ditambahkan", data: newPayment });
-    } catch (e) {
-        res.status(500).json({ message: "Gagal menambah pembayaran", error: e.message });
-    }
+    } catch (e) { res.status(500).json({ message: "Gagal menambah pembayaran", error: e.message }); }
 });
 
 // GET: Export data reservasi ke Excel
@@ -184,7 +227,6 @@ app.get('/api/reservations/export', async (req, res) => {
         const workbook = new ExcelJS.Workbook();
         const worksheet = workbook.addWorksheet('Reservations');
         
-        // Definisikan header kolom
         worksheet.columns = [
             { header: 'Nomor Invoice', key: 'nomorInvoice', width: 25 },
             { header: 'Tanggal Reservasi', key: 'tanggalReservasi', width: 15 },
