@@ -1,4 +1,4 @@
-// migrate.js (Versi Cerdas untuk menangani CSV multi-baris)
+// migrate.js (Versi Final - Paling Tangguh)
 require('dotenv').config();
 const { MongoClient, ObjectId } = require('mongodb');
 const fs = require('fs');
@@ -96,7 +96,7 @@ function parseDate(dateStr) {
 
 async function migrate() {
     try {
-        console.log("🚀 Memulai proses migrasi data (dengan mode cerdas)...");
+        console.log("🚀 Memulai proses migrasi data (versi final)...");
 
         const [reservationsData, addonsData, paymentsData] = await Promise.all([
             readReservationsCsvSmart(path.join(__dirname, 'reservations.csv')),
@@ -114,9 +114,10 @@ async function migrate() {
         for (const row of reservationsData) {
             const inv = row['Nomor Invoice'];
             if (inv && inv.trim() !== '') {
-                reservationsMap.set(inv.trim(), { // Pastikan key juga di-trim
+                const cleanInv = inv.trim().replace(/"/g, '');
+                reservationsMap.set(cleanInv, {
                     _id: new ObjectId(),
-                    nomorInvoice: inv.trim(),
+                    nomorInvoice: cleanInv,
                     tanggalReservasi: parseDate(row['Tanggal Reservasi']),
                     venue: row['Venue'],
                     kategoriEvent: row['Kategori Event'],
@@ -142,9 +143,12 @@ async function migrate() {
             }
         }
 
+        let addonsMatched = 0;
         for (const row of addonsData) {
-            // **PERBAIKAN DI SINI:** Membersihkan nomor invoice dari addons.csv
-            const inv = row['No INV'] ? row['No INV'].trim().replace(/"/g, '') : null;
+            const invKey = Object.keys(row).find(k => k.toUpperCase().includes('INV'));
+            if (!invKey) continue;
+            
+            const inv = row[invKey] ? row[invKey].trim().replace(/"/g, '') : null;
             if (inv && reservationsMap.has(inv)) {
                 const pax = parseInt(row['#Jumlah PAX']) || 0;
                 const harga = parseCurrency(row['#Harga/Pax']);
@@ -157,12 +161,16 @@ async function migrate() {
                     catatan: row['Catatan Tambahan'] || '',
                     createdAt: new Date()
                 });
+                addonsMatched++;
             }
         }
 
+        let paymentsMatched = 0;
         for (const row of paymentsData) {
-            // **PERBAIKAN DI SINI:** Membersihkan nomor invoice dari payments.csv
-            const inv = row['INV'] ? row['INV'].trim().replace(/"/g, '') : null;
+            const invKey = Object.keys(row).find(k => k.toUpperCase().includes('INV'));
+            if (!invKey) continue;
+
+            const inv = row[invKey] ? row[invKey].trim().replace(/"/g, '') : null;
             if (inv && reservationsMap.has(inv)) {
                 reservationsMap.get(inv).pembayaran.push({
                     _id: new ObjectId(),
@@ -171,11 +179,16 @@ async function migrate() {
                     buktiUrl: row['Bukti'] || '',
                     createdAt: new Date()
                 });
+                paymentsMatched++;
             }
         }
+        
+        console.log(`🔗 Proses penggabungan data selesai:`);
+        console.log(`   - ${addonsMatched} dari ${addonsData.length} data add-ons berhasil dicocokkan.`);
+        console.log(`   - ${paymentsMatched} dari ${paymentsData.length} data pembayaran berhasil dicocokkan.`);
 
         await client.connect();
-        console.log("🔗 Terhubung ke MongoDB...");
+        console.log("🔌 Terhubung ke MongoDB...");
         const database = client.db(dbName);
         const collection = database.collection('reservations');
         
@@ -194,7 +207,7 @@ async function migrate() {
         console.error("❌ Terjadi kesalahan saat migrasi:", e);
     } finally {
         await client.close();
-        console.log("🔌 Koneksi MongoDB ditutup.");
+        console.log("🚪 Koneksi MongoDB ditutup.");
     }
 }
 
