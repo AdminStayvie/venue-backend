@@ -46,26 +46,21 @@ function readReservationsCsvSmart(filePath) {
             const line = lines[i].trim();
             if (!line) continue;
 
-            // Regex untuk mendeteksi baris yang dimulai dengan format Invoice
             const invoiceRegex = /^"INV\/\d{4}\/\d{2}-VE-\d{4}/;
 
             if (invoiceRegex.test(line)) {
-                // Jika ini baris baru, simpan record sebelumnya (jika ada)
                 if (currentRecord) {
                     data.push(currentRecord);
                 }
-                // Mulai record baru
                 const values = line.split(',');
                 currentRecord = {};
                 headers.forEach((header, index) => {
                     currentRecord[header] = (values[index] || '').replace(/"/g, '');
                 });
             } else if (currentRecord) {
-                // Jika bukan baris baru, gabungkan ke kolom 'Catatan' dari record sebelumnya
                 currentRecord['Catatan'] = (currentRecord['Catatan'] || '') + ' ' + line.replace(/"/g, '');
             }
         }
-        // Simpan record terakhir
         if (currentRecord) {
             data.push(currentRecord);
         }
@@ -83,7 +78,6 @@ function parseCurrency(value) {
 function parseDate(dateStr) {
     if (!dateStr || dateStr.trim() === '') return null;
     try {
-        // Mencoba format "DD MMMM YYYY" seperti "03 Mei 2025"
         const months = { 'januari': 0, 'februari': 1, 'maret': 2, 'april': 3, 'mei': 4, 'juni': 5, 'juli': 6, 'agustus': 7, 'september': 8, 'oktober': 9, 'november': 10, 'desember': 11 };
         const parts = dateStr.toLowerCase().split(' ');
         if (parts.length === 3 && months[parts[1]] !== undefined) {
@@ -120,9 +114,9 @@ async function migrate() {
         for (const row of reservationsData) {
             const inv = row['Nomor Invoice'];
             if (inv && inv.trim() !== '') {
-                reservationsMap.set(inv, {
+                reservationsMap.set(inv.trim(), { // Pastikan key juga di-trim
                     _id: new ObjectId(),
-                    nomorInvoice: inv,
+                    nomorInvoice: inv.trim(),
                     tanggalReservasi: parseDate(row['Tanggal Reservasi']),
                     venue: row['Venue'],
                     kategoriEvent: row['Kategori Event'],
@@ -149,8 +143,9 @@ async function migrate() {
         }
 
         for (const row of addonsData) {
-            const inv = row['No INV'];
-            if (reservationsMap.has(inv)) {
+            // **PERBAIKAN DI SINI:** Membersihkan nomor invoice dari addons.csv
+            const inv = row['No INV'] ? row['No INV'].trim().replace(/"/g, '') : null;
+            if (inv && reservationsMap.has(inv)) {
                 const pax = parseInt(row['#Jumlah PAX']) || 0;
                 const harga = parseCurrency(row['#Harga/Pax']);
                 reservationsMap.get(inv).addons.push({
@@ -166,8 +161,9 @@ async function migrate() {
         }
 
         for (const row of paymentsData) {
-            const inv = row['INV'];
-            if (reservationsMap.has(inv)) {
+            // **PERBAIKAN DI SINI:** Membersihkan nomor invoice dari payments.csv
+            const inv = row['INV'] ? row['INV'].trim().replace(/"/g, '') : null;
+            if (inv && reservationsMap.has(inv)) {
                 reservationsMap.get(inv).pembayaran.push({
                     _id: new ObjectId(),
                     jumlah: parseCurrency(row['# Pembayaran']),
