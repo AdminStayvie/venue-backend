@@ -1,9 +1,11 @@
-// index.js (Dengan Fitur Lengkap: CRUD, Sort, Search Lanjutan)
+// index.js (Dengan Logika Invoice yang Diperbaiki)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { MongoClient, ObjectId } = require('mongodb');
 const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
 const ExcelJS = require('exceljs');
 
 const app = express();
@@ -11,10 +13,26 @@ const port = process.env.PORT || 3001;
 const mongoUri = process.env.MONGO_URI;
 const dbName = process.env.DB_NAME || 'venueDB';
 
+// Konfigurasi Multer untuk menyimpan file
+const storage = multer.diskStorage({
+    destination: function (req, file, cb) {
+        const uploadPath = path.join(__dirname, 'uploads');
+        // Buat folder jika belum ada
+        fs.mkdirSync(uploadPath, { recursive: true });
+        cb(null, uploadPath);
+    },
+    filename: function (req, file, cb) {
+        // Buat nama file unik untuk menghindari tumpang tindih
+        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+        cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+    }
+});
+const upload = multer({ storage: storage });
+
 // Middleware
 app.use(cors());
 app.use(express.json());
-const upload = multer({ storage: multer.memoryStorage() });
+app.use('/uploads', express.static(path.join(__dirname, 'uploads'))); // Serve file statis
 
 if (!mongoUri) {
     console.error("Error: MONGO_URI tidak ditemukan di file .env");
@@ -38,19 +56,20 @@ async function connectDB() {
 
 // === API Endpoints ===
 
-// GET: Mengambil data reservasi (dengan pencarian, sort, paginasi)
+// GET: Mengambil data reservasi
 app.get('/api/reservations', async (req, res) => {
     try {
         const { search = '', searchBy = 'namaClient', page = 1, limit = 10, sort = 'tanggalEvent', order = 'desc' } = req.query;
         
         let query = {};
         if (search) {
-            // Jika searchBy adalah tanggal, kita perlu query rentang
             if (searchBy === 'tanggalEvent') {
                 const searchDate = new Date(search);
                 if (!isNaN(searchDate.getTime())) {
-                    const startOfDay = new Date(searchDate.setHours(0, 0, 0, 0));
-                    const endOfDay = new Date(searchDate.setHours(23, 59, 59, 999));
+                    const startOfDay = new Date(searchDate);
+                    startOfDay.setUTCHours(0, 0, 0, 0);
+                    const endOfDay = new Date(searchDate);
+                    endOfDay.setUTCHours(23, 59, 59, 999);
                     query[searchBy] = { $gte: startOfDay, $lte: endOfDay };
                 }
             } else {
@@ -81,7 +100,7 @@ app.get('/api/reservations', async (req, res) => {
     }
 });
 
-// GET: Mengambil satu data reservasi berdasarkan ID
+// GET: Mengambil satu data reservasi
 app.get('/api/reservations/:id', async (req, res) => {
     try {
         const { id } = req.params;
@@ -105,9 +124,25 @@ app.post('/api/reservations', async (req, res) => {
         const now = new Date();
         const year = now.getFullYear();
         const month = String(now.getMonth() + 1).padStart(2, '0');
-        const count = await reservationsCollection.countDocuments();
-        const nextId = String(count + 1).padStart(4, '0');
+
+        // --- LOGIKA BARU UNTUK NOMOR INVOICE ---
+        // 1. Cari invoice terakhir di bulan dan tahun yang sama
+        const lastInvoice = await reservationsCollection.findOne(
+            { nomorInvoice: { $regex: `^INV/${year}/${month}-VE-` } },
+            { sort: { nomorInvoice: -1 } }
+        );
+
+        let nextIdNumber = 1;
+        if (lastInvoice) {
+            // 2. Ambil nomor urut dari invoice terakhir dan tambah 1
+            const lastId = parseInt(lastInvoice.nomorInvoice.split('-').pop());
+            nextIdNumber = lastId + 1;
+        }
+        
+        // 3. Format nomor urut menjadi 4 digit (e.g., 0001, 0014)
+        const nextId = String(nextIdNumber).padStart(4, '0');
         const nomorInvoice = `INV/${year}/${month}-VE-${nextId}`;
+        // --- AKHIR LOGIKA BARU ---
 
         const reservation = {
             _id: new ObjectId(),
@@ -132,7 +167,8 @@ app.post('/api/reservations', async (req, res) => {
     }
 });
 
-// PUT: Mengupdate reservasi berdasarkan ID
+
+// PUT: Mengupdate reservasi
 app.put('/api/reservations/:id', async (req, res) => {
     try {
         const { id } = req.params;
@@ -163,7 +199,7 @@ app.put('/api/reservations/:id', async (req, res) => {
     }
 });
 
-// DELETE: Menghapus reservasi berdasarkan ID
+// DELETE: Menghapus reservasi
 app.delete('/api/reservations/:id', async (req, res) => {
     try {
         const { id } = req.params;
@@ -180,7 +216,7 @@ app.delete('/api/reservations/:id', async (req, res) => {
     }
 });
 
-// POST: Menambah item add-on baru
+// POST: Menambah item add-on
 app.post('/api/reservations/:id/addons', async (req, res) => {
     const { id } = req.params;
     const { item, pax, hargaPerPax, subTotal, catatan } = req.body;
@@ -203,13 +239,19 @@ app.post('/api/reservations/:id/addons', async (req, res) => {
 });
 
 // POST: Menambah pembayaran baru
-app.post('/api/reservations/:id/pembayaran', async (req, res) => {
+app.post('/api/reservations/:id/pembayaran', upload.single('bukti'), async (req, res) => {
     const { id } = req.params;
-    const { jumlah, tanggal } = req.body;
+    const { jumlah, tanggal, nomorKwitansi } = req.body;
     if (!ObjectId.isValid(id)) return res.status(400).json({ message: "ID tidak valid" });
     if (!jumlah || !tanggal) return res.status(400).json({ message: "Jumlah dan tanggal pembayaran harus diisi." });
+    
     const newPayment = {
-        _id: new ObjectId(), jumlah: parseFloat(jumlah), tanggal: new Date(tanggal), createdAt: new Date()
+        _id: new ObjectId(),
+        nomorKwitansi,
+        jumlah: parseFloat(jumlah),
+        tanggal: new Date(tanggal),
+        buktiUrl: req.file ? `/uploads/${req.file.filename}` : '',
+        createdAt: new Date()
     };
     try {
         const result = await reservationsCollection.updateOne(
@@ -219,87 +261,6 @@ app.post('/api/reservations/:id/pembayaran', async (req, res) => {
         if (result.matchedCount === 0) return res.status(404).json({ message: `Reservasi tidak ditemukan.` });
         res.status(201).json({ message: "Pembayaran berhasil ditambahkan", data: newPayment });
     } catch (e) { res.status(500).json({ message: "Gagal menambah pembayaran", error: e.message }); }
-});
-
-// GET: Export data reservasi ke Excel
-app.get('/api/reservations/export', async (req, res) => {
-    try {
-        const workbook = new ExcelJS.Workbook();
-        const worksheet = workbook.addWorksheet('Reservations');
-        
-        worksheet.columns = [
-            { header: 'Nomor Invoice', key: 'nomorInvoice', width: 25 },
-            { header: 'Tanggal Reservasi', key: 'tanggalReservasi', width: 15 },
-            { header: 'Tanggal Event', key: 'tanggalEvent', width: 15 },
-            { header: 'Nama Client', key: 'namaClient', width: 20 },
-            { header: 'Venue', key: 'venue', width: 15 },
-            { header: 'Kategori Event', key: 'kategoriEvent', width: 15 },
-            { header: 'Nama Sales', key: 'namaSales', width: 15 },
-            { header: 'Pax', key: 'pax', width: 10 },
-            { header: 'Sub Total', key: 'subTotal', width: 15, style: { numFmt: '"Rp"#,##0' } },
-            { header: 'DP', key: 'dp', width: 15, style: { numFmt: '"Rp"#,##0' } },
-            { header: 'Dibatalkan', key: 'dibatalkan', width: 12 },
-        ];
-
-        const reservations = await reservationsCollection.find({}).toArray();
-        worksheet.addRows(reservations);
-
-        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-        res.setHeader('Content-Disposition', 'attachment; filename="reservations.xlsx"');
-
-        const buffer = await workbook.xlsx.writeBuffer();
-        res.send(buffer);
-
-    } catch (e) {
-        res.status(500).json({ message: "Gagal mengekspor data", error: e.message });
-    }
-});
-
-// POST: Import data dari Excel
-app.post('/api/reservations/import', upload.single('file'), async (req, res) => {
-    if (!req.file) {
-        return res.status(400).send('Tidak ada file yang diunggah.');
-    }
-
-    try {
-        const workbook = new ExcelJS.Workbook();
-        const buffer = req.file.buffer;
-        await workbook.xlsx.load(buffer);
-        
-        const worksheet = workbook.getWorksheet(1);
-        const reservationsToInsert = [];
-        
-        worksheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
-            if (rowNumber === 1) return; // Skip header row
-
-            reservationsToInsert.push({
-                nomorInvoice: row.getCell('A').value,
-                tanggalReservasi: new Date(row.getCell('B').value),
-                tanggalEvent: new Date(row.getCell('C').value),
-                namaClient: row.getCell('D').value,
-                venue: row.getCell('E').value,
-                kategoriEvent: row.getCell('F').value,
-                namaSales: row.getCell('G').value,
-                pax: parseInt(row.getCell('H').value),
-                subTotal: parseFloat(row.getCell('I').value),
-                dp: parseFloat(row.getCell('J').value),
-                dibatalkan: row.getCell('K').value === 'TRUE' || row.getCell('K').value === true,
-                pembayaran: [],
-                addons: [],
-                createdAt: new Date(),
-                updatedAt: new Date(),
-            });
-        });
-
-        if (reservationsToInsert.length > 0) {
-            await reservationsCollection.insertMany(reservationsToInsert, { ordered: false });
-        }
-        
-        res.status(201).json({ message: `${reservationsToInsert.length} data berhasil diimpor.` });
-
-    } catch (e) {
-        res.status(500).json({ message: "Gagal mengimpor data", error: e.message });
-    }
 });
 
 
