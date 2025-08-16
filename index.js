@@ -1,4 +1,4 @@
-// index.js (Dengan Logika DP Otomatis & Invoice yang Diperbaiki)
+// index.js (Dengan Logika Kwitansi & DP Otomatis yang Diperbaiki)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -80,8 +80,8 @@ app.get('/api/reservations', async (req, res) => {
         const reservations = await reservationsCollection
             .find(query)
             .sort({ [sort]: sortOrder })
-            .skip((page - 1) * limit)
             .limit(parseInt(limit))
+            .skip((page - 1) * limit)
             .toArray();
 
         const total = await reservationsCollection.countDocuments(query);
@@ -140,22 +140,38 @@ app.post('/api/reservations', async (req, res) => {
         const dpAmount = parseFloat(newData.dp) || 0;
         const initialPayments = [];
 
-        // --- LOGIKA BARU UNTUK DP OTOMATIS ---
         if (dpAmount > 0) {
-            const kwitansiCount = 1;
-            const kwitansiId = String(kwitansiCount).padStart(4, '0');
+            // Cari kwitansi terakhir di bulan dan tahun yang sama di seluruh koleksi
+            const lastKwitansi = await reservationsCollection.findOne(
+                { "pembayaran.nomorKwitansi": { $regex: `^NOTA/${year}/${month}-SDP-` } },
+                { sort: { "pembayaran.nomorKwitansi": -1 } }
+            );
+
+            let nextKwitansiNum = 1;
+            if (lastKwitansi && lastKwitansi.pembayaran.length > 0) {
+                // Ambil nomor terakhir dari semua pembayaran yang cocok
+                const kwitansiNumbers = lastKwitansi.pembayaran
+                    .map(p => p.nomorKwitansi)
+                    .filter(k => k.startsWith(`NOTA/${year}/${month}-SDP-`))
+                    .map(k => parseInt(k.split('-').pop()));
+                
+                if (kwitansiNumbers.length > 0) {
+                    nextKwitansiNum = Math.max(...kwitansiNumbers) + 1;
+                }
+            }
+            
+            const kwitansiId = String(nextKwitansiNum).padStart(4, '0');
             const nomorKwitansi = `NOTA/${year}/${month}-SDP-${kwitansiId}`;
 
             initialPayments.push({
                 _id: new ObjectId(),
                 nomorKwitansi: nomorKwitansi,
                 jumlah: dpAmount,
-                tanggal: new Date(newData.tanggalReservasi), // Asumsi tanggal DP = tanggal reservasi
-                buktiUrl: '', // Kosong karena ini otomatis
+                tanggal: new Date(newData.tanggalReservasi),
+                buktiUrl: '',
                 createdAt: new Date()
             });
         }
-        // --- AKHIR LOGIKA BARU ---
 
         const reservation = {
             _id: new ObjectId(),
@@ -168,7 +184,7 @@ app.post('/api/reservations', async (req, res) => {
             subTotal: parseFloat(newData.subTotal),
             dp: dpAmount,
             dibatalkan: false,
-            pembayaran: initialPayments, // Masukkan data DP ke riwayat pembayaran
+            pembayaran: initialPayments,
             addons: [],
             createdAt: new Date(),
             updatedAt: new Date(),
@@ -254,13 +270,13 @@ app.post('/api/reservations/:id/addons', async (req, res) => {
 // POST: Menambah pembayaran baru
 app.post('/api/reservations/:id/pembayaran', upload.single('bukti'), async (req, res) => {
     const { id } = req.params;
-    const { jumlah, tanggal, nomorKwitansi } = req.body;
+    const { jumlah, tanggal, nomorKwitansi: clientNomorKwitansi } = req.body; // Ambil nomor dari client
     if (!ObjectId.isValid(id)) return res.status(400).json({ message: "ID tidak valid" });
     if (!jumlah || !tanggal) return res.status(400).json({ message: "Jumlah dan tanggal pembayaran harus diisi." });
     
     const newPayment = {
         _id: new ObjectId(),
-        nomorKwitansi,
+        nomorKwitansi: clientNomorKwitansi, // Gunakan nomor yang di-generate client
         jumlah: parseFloat(jumlah),
         tanggal: new Date(tanggal),
         buktiUrl: req.file ? `/uploads/${req.file.filename}` : '',
