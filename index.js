@@ -141,23 +141,19 @@ app.post('/api/reservations', async (req, res) => {
         const initialPayments = [];
 
         if (dpAmount > 0) {
-            // Cari kwitansi terakhir di bulan dan tahun yang sama di seluruh koleksi
-            const lastKwitansi = await reservationsCollection.findOne(
-                { "pembayaran.nomorKwitansi": { $regex: `^NOTA/${year}/${month}-SDP-` } },
-                { sort: { "pembayaran.nomorKwitansi": -1 } }
-            );
+            const pipeline = [
+                { $unwind: "$pembayaran" },
+                { $match: { "pembayaran.nomorKwitansi": { $regex: `^NOTA/${year}/${month}-SDP-` } } },
+                { $sort: { "pembayaran.nomorKwitansi": -1 } },
+                { $limit: 1 }
+            ];
+            const lastPaymentResult = await reservationsCollection.aggregate(pipeline).toArray();
 
             let nextKwitansiNum = 1;
-            if (lastKwitansi && lastKwitansi.pembayaran.length > 0) {
-                // Ambil nomor terakhir dari semua pembayaran yang cocok
-                const kwitansiNumbers = lastKwitansi.pembayaran
-                    .map(p => p.nomorKwitansi)
-                    .filter(k => k.startsWith(`NOTA/${year}/${month}-SDP-`))
-                    .map(k => parseInt(k.split('-').pop()));
-                
-                if (kwitansiNumbers.length > 0) {
-                    nextKwitansiNum = Math.max(...kwitansiNumbers) + 1;
-                }
+            if (lastPaymentResult.length > 0) {
+                const lastKwitansi = lastPaymentResult[0].pembayaran.nomorKwitansi;
+                const lastNum = parseInt(lastKwitansi.split('-').pop());
+                nextKwitansiNum = lastNum + 1;
             }
             
             const kwitansiId = String(nextKwitansiNum).padStart(4, '0');
@@ -270,19 +266,42 @@ app.post('/api/reservations/:id/addons', async (req, res) => {
 // POST: Menambah pembayaran baru
 app.post('/api/reservations/:id/pembayaran', upload.single('bukti'), async (req, res) => {
     const { id } = req.params;
-    const { jumlah, tanggal, nomorKwitansi: clientNomorKwitansi } = req.body; // Ambil nomor dari client
+    const { jumlah, tanggal } = req.body;
     if (!ObjectId.isValid(id)) return res.status(400).json({ message: "ID tidak valid" });
     if (!jumlah || !tanggal) return res.status(400).json({ message: "Jumlah dan tanggal pembayaran harus diisi." });
     
-    const newPayment = {
-        _id: new ObjectId(),
-        nomorKwitansi: clientNomorKwitansi, // Gunakan nomor yang di-generate client
-        jumlah: parseFloat(jumlah),
-        tanggal: new Date(tanggal),
-        buktiUrl: req.file ? `/uploads/${req.file.filename}` : '',
-        createdAt: new Date()
-    };
     try {
+        const now = new Date();
+        const year = now.getFullYear();
+        const month = String(now.getMonth() + 1).padStart(2, '0');
+
+        const pipeline = [
+            { $unwind: "$pembayaran" },
+            { $match: { "pembayaran.nomorKwitansi": { $regex: `^NOTA/${year}/${month}-SDP-` } } },
+            { $sort: { "pembayaran.nomorKwitansi": -1 } },
+            { $limit: 1 }
+        ];
+        const lastPaymentResult = await reservationsCollection.aggregate(pipeline).toArray();
+
+        let nextKwitansiNum = 1;
+        if (lastPaymentResult.length > 0) {
+            const lastKwitansi = lastPaymentResult[0].pembayaran.nomorKwitansi;
+            const lastNum = parseInt(lastKwitansi.split('-').pop());
+            nextKwitansiNum = lastNum + 1;
+        }
+
+        const kwitansiId = String(nextKwitansiNum).padStart(4, '0');
+        const nomorKwitansi = `NOTA/${year}/${month}-SDP-${kwitansiId}`;
+
+        const newPayment = {
+            _id: new ObjectId(),
+            nomorKwitansi,
+            jumlah: parseFloat(jumlah),
+            tanggal: new Date(tanggal),
+            buktiUrl: req.file ? `/uploads/${req.file.filename}` : '',
+            createdAt: new Date()
+        };
+
         const result = await reservationsCollection.updateOne(
             { _id: new ObjectId(id) },
             { $push: { pembayaran: newPayment }, $set: { updatedAt: new Date() } }
