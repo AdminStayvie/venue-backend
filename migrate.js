@@ -1,154 +1,72 @@
-// migrate.js (Update-Only version for Addons & Payments)
+// migrate.js (For Restructuring to Separate Collections)
 require('dotenv').config();
 const { MongoClient, ObjectId } = require('mongodb');
-const fs = require('fs');
-const path = require('path');
-const csv = require('csv-parser');
 
 const mongoUri = process.env.MONGO_URI;
 const dbName = process.env.DB_NAME || 'venueDB';
 
 if (!mongoUri) {
-    console.error("Error: MONGO_URI tidak ditemukan di file .env.");
+    console.error("Error: MONGO_URI is not defined in .env file.");
     process.exit(1);
 }
 
 const client = new MongoClient(mongoUri);
 
-// Fungsi untuk membaca file CSV
-function readCsv(filePath) {
-    return new Promise((resolve, reject) => {
-        const results = [];
-        fs.createReadStream(filePath)
-            .pipe(csv({ mapHeaders: ({ header }) => header.trim() }))
-            .on('data', (data) => results.push(data))
-            .on('end', () => resolve(results))
-            .on('error', (error) => reject(error));
-    });
-}
-
-// Fungsi untuk mengubah format Rupiah
-function parseCurrency(value) {
-    if (typeof value !== 'string' || !value) return 0;
-    return parseFloat(value.replace(/[^0-9,]+/g, "").replace(",", ".")) || 0;
-}
-
-// Fungsi untuk mengubah format tanggal
-function parseDate(dateStr) {
-    if (!dateStr || dateStr.trim() === '') return null;
-    const months = {
-        'jan': 0, 'feb': 1, 'mar': 2, 'apr': 3, 'mei': 4, 'jun': 5, 
-        'jul': 6, 'agu': 7, 'sep': 8, 'okt': 9, 'nov': 10, 'des': 11
-    };
-    try {
-        const parts = dateStr.toLowerCase().split('-');
-        if (parts.length === 3) {
-            const day = parseInt(parts[0]);
-            const month = months[parts[1].substring(0, 3)];
-            const year = parseInt(parts[2]);
-            if (!isNaN(day) && month !== undefined && !isNaN(year)) {
-                return new Date(Date.UTC(year, month, day)); // Simpan sebagai UTC
-            }
-        }
-    } catch (e) { /* Lanjut */ }
-    
-    const date = new Date(dateStr);
-    return isNaN(date.getTime()) ? new Date() : date;
-}
-
 async function migrate() {
     try {
         await client.connect();
-        console.log("🔌 Terhubung ke MongoDB...");
-        const database = client.db(dbName);
-        const collection = database.collection('reservations');
+        console.log("🔌 Connected to MongoDB...");
+        const db = client.db(dbName);
+        const oldReservationsCollection = db.collection('reservations');
+        const newReservationsCollection = db.collection('reservations_new');
+        const addonsCollection = db.collection('addons');
+        const paymentsCollection = db.collection('payments');
 
-        console.log("🚀 Memulai proses migrasi data (Mode Update)...");
+        // Clear new collections to prevent duplicates on re-run
+        await newReservationsCollection.deleteMany({});
+        await addonsCollection.deleteMany({});
+        await paymentsCollection.deleteMany({});
+        console.log("🗑️  Cleaned up new collections.");
 
-        // 1. Baca file addons dan payments
-        const [addonsData, paymentsData] = await Promise.all([
-            readCsv(path.join(__dirname, 'addons.csv')),
-            readCsv(path.join(__dirname, 'payments.csv'))
-        ]);
-        
-        console.log(`📊 Data CSV berhasil dibaca: ${addonsData.length} addons, ${paymentsData.length} payments.`);
+        const reservations = await oldReservationsCollection.find().toArray();
+        console.log(`🚚 Found ${reservations.length} reservations to migrate.`);
 
-        // 2. Kosongkan dulu array addons dan pembayaran yang ada di database
-        console.log("🗑️ Mengosongkan data addons & pembayaran lama di database...");
-        await collection.updateMany({}, { $set: { addons: [], pembayaran: [] } });
+        for (const res of reservations) {
+            const reservationId = res._id; // Keep original ID
 
-        // 3. Proses dan update Addons
-        let addonsMatched = 0;
-        let addonsNotFound = [];
-        for (const row of addonsData) {
-            const inv = row['No INV'] ? row['No INV'].trim() : null;
-            if (inv) {
-                const newAddon = {
-                    _id: new ObjectId(),
-                    item: row['Item'],
-                    pax: parseInt(row['Jumlah PAX']) || 0,
-                    hargaPerPax: parseCurrency(row['Harga/Pax']),
-                    subTotal: parseCurrency(row['Sub Total']),
-                    catatan: row['Catatan Tambahan'] || '',
-                    createdAt: new Date()
-                };
-                
-                const result = await collection.updateOne(
-                    { nomorInvoice: inv },
-                    { $push: { addons: newAddon } }
-                );
-
-                if (result.matchedCount > 0) {
-                    addonsMatched++;
-                } else {
-                    addonsNotFound.push(inv);
-                }
+            // 1. Migrate Addons
+            if (res.addons && res.addons.length > 0) {
+                const addonsToInsert = res.addons.map(addon => ({
+                    ...addon,
+                    reservationId: reservationId, // Link to parent
+                }));
+                await addonsCollection.insertMany(addonsToInsert);
             }
-        }
-        console.log(`🔗 ${addonsMatched} dari ${addonsData.length} data add-ons berhasil diupdate.`);
-        if (addonsNotFound.length > 0) {
-            console.warn(`   - Addons tidak ditemukan untuk invoice: ${[...new Set(addonsNotFound)].join(', ')}`);
-        }
 
-        // 4. Proses dan update Pembayaran
-        let paymentsMatched = 0;
-        let paymentsNotFound = [];
-        for (const row of paymentsData) {
-            const inv = row['INV'] ? row['INV'].trim() : null;
-            if (inv) {
-                const newPayment = {
-                    _id: new ObjectId(),
-                    nomorKwitansi: row['No Kwitansi'],
-                    jumlah: parseCurrency(row['# Pembayaran']),
-                    tanggal: parseDate(row['Tanggal']),
-                    buktiUrl: row['Bukti'] || '',
-                    createdAt: new Date()
-                };
-
-                const result = await collection.updateOne(
-                    { nomorInvoice: inv },
-                    { $push: { pembayaran: newPayment } }
-                );
-
-                if (result.matchedCount > 0) {
-                    paymentsMatched++;
-                } else {
-                    paymentsNotFound.push(inv);
-                }
+            // 2. Migrate Payments
+            if (res.pembayaran && res.pembayaran.length > 0) {
+                const paymentsToInsert = res.pembayaran.map(payment => ({
+                    ...payment,
+                    reservationId: reservationId, // Link to parent
+                }));
+                await paymentsCollection.insertMany(paymentsToInsert);
             }
-        }
-        console.log(`🔗 ${paymentsMatched} dari ${paymentsData.length} data pembayaran berhasil diupdate.`);
-        if (paymentsNotFound.length > 0) {
-            console.warn(`   - Pembayaran tidak ditemukan untuk invoice: ${[...new Set(paymentsNotFound)].join(', ')}`);
+
+            // 3. Create new reservation document without embedded arrays
+            const { addons, pembayaran, ...newReservationData } = res;
+            await newReservationsCollection.insertOne(newReservationData);
         }
 
-        console.log("🎉 Migrasi SUKSES!");
+        console.log("✅ Migration complete!");
+        console.log("👉 Now, you should manually perform these steps:");
+        console.log("   1. Drop the old 'reservations' collection.");
+        console.log("   2. Rename 'reservations_new' to 'reservations'.");
 
     } catch (e) {
-        console.error("❌ Terjadi kesalahan saat migrasi:", e);
+        console.error("❌ Migration failed:", e);
     } finally {
         await client.close();
-        console.log("🚪 Koneksi MongoDB ditutup.");
+        console.log("🚪 MongoDB connection closed.");
     }
 }
 

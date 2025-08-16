@@ -1,4 +1,4 @@
-// index.js (Dengan Logika Kwitansi & DP Otomatis yang Diperbaiki)
+// index.js (Restructured for Separate Collections)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -6,14 +6,13 @@ const { MongoClient, ObjectId } = require('mongodb');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const ExcelJS = require('exceljs');
 
 const app = express();
 const port = process.env.PORT || 3001;
 const mongoUri = process.env.MONGO_URI;
 const dbName = process.env.DB_NAME || 'venueDB';
 
-// Konfigurasi Multer
+// Multer Config
 const storage = multer.diskStorage({
     destination: function (req, file, cb) {
         const uploadPath = path.join(__dirname, 'uploads');
@@ -33,33 +32,36 @@ app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 if (!mongoUri) {
-    console.error("Error: MONGO_URI tidak ditemukan di file .env");
+    console.error("Error: MONGO_URI is not defined in .env file");
     process.exit(1);
 }
 
 const client = new MongoClient(mongoUri);
-let reservationsCollection;
+let db;
+let reservationsCollection, addonsCollection, paymentsCollection;
 
 async function connectDB() {
     try {
         await client.connect();
-        const database = client.db(dbName);
-        reservationsCollection = database.collection('reservations');
-        console.log(`Terhubung ke MongoDB, database: ${dbName}`);
+        db = client.db(dbName);
+        reservationsCollection = db.collection('reservations');
+        addonsCollection = db.collection('addons');
+        paymentsCollection = db.collection('payments');
+        console.log(`Connected to MongoDB, database: ${dbName}`);
     } catch (e) {
-        console.error("Gagal terhubung ke MongoDB", e);
+        console.error("Failed to connect to MongoDB", e);
         process.exit(1);
     }
 }
 
-// === API Endpoints ===
+// === RESERVATIONS API ===
 
-// GET: Mengambil data reservasi
+// GET all reservations with aggregated data
 app.get('/api/reservations', async (req, res) => {
     try {
         const { search = '', searchBy = 'namaClient', page = 1, limit = 10, sort = 'tanggalEvent', order = 'desc' } = req.query;
         
-        let query = {};
+        let matchStage = {};
         if (search) {
             if (searchBy === 'tanggalEvent') {
                 const searchDate = new Date(search);
@@ -68,54 +70,66 @@ app.get('/api/reservations', async (req, res) => {
                     startOfDay.setUTCHours(0, 0, 0, 0);
                     const endOfDay = new Date(searchDate);
                     endOfDay.setUTCHours(23, 59, 59, 999);
-                    query[searchBy] = { $gte: startOfDay, $lte: endOfDay };
+                    matchStage[searchBy] = { $gte: startOfDay, $lte: endOfDay };
                 }
             } else {
-                query[searchBy] = { $regex: search, $options: 'i' };
+                matchStage[searchBy] = { $regex: search, $options: 'i' };
             }
         }
         
         const sortOrder = order === 'asc' ? 1 : -1;
-        
-        const reservations = await reservationsCollection
-            .find(query)
-            .sort({ [sort]: sortOrder })
-            .limit(parseInt(limit))
-            .skip((page - 1) * limit)
-            .toArray();
+        const skip = (parseInt(page) - 1) * parseInt(limit);
 
-        const total = await reservationsCollection.countDocuments(query);
+        const pipeline = [
+            { $match: matchStage },
+            { $sort: { [sort]: sortOrder } },
+            { $skip: skip },
+            { $limit: parseInt(limit) },
+            {
+                $lookup: {
+                    from: 'addons',
+                    localField: '_id',
+                    foreignField: 'reservationId',
+                    as: 'addons'
+                }
+            },
+        ];
+
+        const reservations = await reservationsCollection.aggregate(pipeline).toArray();
+        const total = await reservationsCollection.countDocuments(matchStage);
 
         res.json({
             data: reservations,
             total,
             page: parseInt(page),
             limit: parseInt(limit),
-            totalPages: Math.ceil(total / limit)
+            totalPages: Math.ceil(total / parseInt(limit))
         });
     } catch (e) {
-        res.status(500).json({ message: "Gagal mengambil data reservasi", error: e.message });
+        res.status(500).json({ message: "Failed to get reservations", error: e.message });
     }
 });
 
-// GET: Mengambil satu data reservasi
+// GET single reservation with details
 app.get('/api/reservations/:id', async (req, res) => {
     try {
         const { id } = req.params;
-        if (!ObjectId.isValid(id)) {
-            return res.status(400).json({ message: "ID tidak valid" });
-        }
-        const reservation = await reservationsCollection.findOne({ _id: new ObjectId(id) });
-        if (!reservation) {
-            return res.status(404).json({ message: "Reservasi tidak ditemukan" });
-        }
-        res.json(reservation);
+        if (!ObjectId.isValid(id)) return res.status(400).json({ message: "Invalid ID" });
+        
+        const reservationId = new ObjectId(id);
+        const reservation = await reservationsCollection.findOne({ _id: reservationId });
+        if (!reservation) return res.status(404).json({ message: "Reservation not found" });
+
+        const addons = await addonsCollection.find({ reservationId: reservationId }).toArray();
+        const payments = await paymentsCollection.find({ reservationId: reservationId }).toArray();
+
+        res.json({ ...reservation, addons, pembayaran: payments });
     } catch (e) {
-        res.status(500).json({ message: "Gagal mengambil data", error: e.message });
+        res.status(500).json({ message: "Failed to get reservation details", error: e.message });
     }
 });
 
-// POST: Membuat reservasi baru
+// POST new reservation
 app.post('/api/reservations', async (req, res) => {
     try {
         const newData = req.body;
@@ -123,196 +137,142 @@ app.post('/api/reservations', async (req, res) => {
         const year = now.getFullYear();
         const month = String(now.getMonth() + 1).padStart(2, '0');
 
-        const lastInvoice = await reservationsCollection.findOne(
-            { nomorInvoice: { $regex: `^INV/${year}/${month}-VE-` } },
-            { sort: { nomorInvoice: -1 } }
-        );
-
-        let nextIdNumber = 1;
-        if (lastInvoice) {
-            const lastId = parseInt(lastInvoice.nomorInvoice.split('-').pop());
-            nextIdNumber = lastId + 1;
-        }
-        
+        const lastInvoice = await reservationsCollection.findOne({ nomorInvoice: { $regex: `^INV/${year}/${month}-VE-` } }, { sort: { nomorInvoice: -1 } });
+        let nextIdNumber = lastInvoice ? parseInt(lastInvoice.nomorInvoice.split('-').pop()) + 1 : 1;
         const nextId = String(nextIdNumber).padStart(4, '0');
         const nomorInvoice = `INV/${year}/${month}-VE-${nextId}`;
 
-        const dpAmount = parseFloat(newData.dp) || 0;
-        const initialPayments = [];
-
-        if (dpAmount > 0) {
-            const pipeline = [
-                { $unwind: "$pembayaran" },
-                { $match: { "pembayaran.nomorKwitansi": { $regex: `^NOTA/${year}/${month}-SDP-` } } },
-                { $sort: { "pembayaran.nomorKwitansi": -1 } },
-                { $limit: 1 }
-            ];
-            const lastPaymentResult = await reservationsCollection.aggregate(pipeline).toArray();
-
-            let nextKwitansiNum = 1;
-            if (lastPaymentResult.length > 0) {
-                const lastKwitansi = lastPaymentResult[0].pembayaran.nomorKwitansi;
-                const lastNum = parseInt(lastKwitansi.split('-').pop());
-                nextKwitansiNum = lastNum + 1;
-            }
-            
-            const kwitansiId = String(nextKwitansiNum).padStart(4, '0');
-            const nomorKwitansi = `NOTA/${year}/${month}-SDP-${kwitansiId}`;
-
-            initialPayments.push({
-                _id: new ObjectId(),
-                nomorKwitansi: nomorKwitansi,
-                jumlah: dpAmount,
-                tanggal: new Date(newData.tanggalReservasi),
-                buktiUrl: '',
-                createdAt: new Date()
-            });
-        }
-
-        const reservation = {
-            _id: new ObjectId(),
-            nomorInvoice,
+        const reservationData = {
             ...newData,
+            nomorInvoice,
+            _id: new ObjectId(),
             tanggalReservasi: new Date(newData.tanggalReservasi),
             tanggalEvent: new Date(newData.tanggalEvent),
             pax: parseInt(newData.pax),
             hargaPerPax: parseFloat(newData.hargaPerPax),
             subTotal: parseFloat(newData.subTotal),
-            dp: dpAmount,
-            dibatalkan: false,
-            pembayaran: initialPayments,
-            addons: [],
+            dp: parseFloat(newData.dp) || 0,
             createdAt: new Date(),
             updatedAt: new Date(),
         };
-        const result = await reservationsCollection.insertOne(reservation);
-        res.status(201).json({ message: "Reservasi berhasil dibuat", data: result });
-    } catch (e) {
-        res.status(500).json({ message: "Gagal membuat reservasi", error: e.message });
-    }
-});
-
-
-// PUT: Mengupdate reservasi
-app.put('/api/reservations/:id', async (req, res) => {
-    try {
-        const { id } = req.params;
-        if (!ObjectId.isValid(id)) {
-            return res.status(400).json({ message: "ID tidak valid" });
-        }
-        const { _id, nomorInvoice, ...updateData } = req.body;
         
-        updateData.tanggalReservasi = new Date(updateData.tanggalReservasi);
-        updateData.tanggalEvent = new Date(updateData.tanggalEvent);
-        updateData.pax = parseInt(updateData.pax);
-        updateData.hargaPerPax = parseFloat(updateData.hargaPerPax);
-        updateData.subTotal = parseFloat(updateData.subTotal);
-        updateData.dp = parseFloat(updateData.dp);
-        updateData.updatedAt = new Date();
+        const result = await reservationsCollection.insertOne(reservationData);
 
-        const result = await reservationsCollection.updateOne(
-            { _id: new ObjectId(id) },
-            { $set: updateData }
-        );
-
-        if (result.matchedCount === 0) {
-            return res.status(404).json({ message: "Reservasi tidak ditemukan" });
+        if (reservationData.dp > 0) {
+            const dpPayment = {
+                reservationId: reservationData._id,
+                jumlah: reservationData.dp,
+                tanggal: new Date(reservationData.tanggalReservasi),
+                buktiUrl: '',
+                createdAt: new Date(),
+            };
+            await addPayment(dpPayment); // Use the new centralized function
         }
-        res.json({ message: "Reservasi berhasil diperbarui" });
+
+        res.status(201).json({ message: "Reservation created successfully", data: result });
     } catch (e) {
-        res.status(500).json({ message: "Gagal memperbarui reservasi", error: e.message });
+        res.status(500).json({ message: "Failed to create reservation", error: e.message });
     }
 });
 
-// DELETE: Menghapus reservasi
+// DELETE reservation and its children
 app.delete('/api/reservations/:id', async (req, res) => {
+    const session = client.startSession();
     try {
-        const { id } = req.params;
-        if (!ObjectId.isValid(id)) {
-            return res.status(400).json({ message: "ID tidak valid" });
-        }
-        const result = await reservationsCollection.deleteOne({ _id: new ObjectId(id) });
-        if (result.deletedCount === 0) {
-            return res.status(404).json({ message: "Reservasi tidak ditemukan" });
-        }
-        res.json({ message: "Reservasi berhasil dihapus" });
+        await session.withTransaction(async () => {
+            const { id } = req.params;
+            if (!ObjectId.isValid(id)) throw new Error("Invalid ID");
+            const reservationId = new ObjectId(id);
+
+            await addonsCollection.deleteMany({ reservationId: reservationId }, { session });
+            await paymentsCollection.deleteMany({ reservationId: reservationId }, { session });
+            const result = await reservationsCollection.deleteOne({ _id: reservationId }, { session });
+
+            if (result.deletedCount === 0) {
+                throw new Error("Reservation not found");
+            }
+        });
+        res.json({ message: "Reservation and all related data deleted successfully" });
     } catch (e) {
-        res.status(500).json({ message: "Gagal menghapus reservasi", error: e.message });
+        res.status(500).json({ message: "Failed to delete reservation", error: e.message });
+    } finally {
+        await session.endSession();
     }
 });
 
-// POST: Menambah item add-on
-app.post('/api/reservations/:id/addons', async (req, res) => {
-    const { id } = req.params;
-    const { item, pax, hargaPerPax, subTotal, catatan } = req.body;
-    if (!ObjectId.isValid(id)) return res.status(400).json({ message: "ID tidak valid" });
-    if (!item || pax === undefined || hargaPerPax === undefined || subTotal === undefined) {
-        return res.status(400).json({ message: "Data add-on tidak lengkap." });
-    }
-    const newAddon = {
-        _id: new ObjectId(), item, pax: parseInt(pax), hargaPerPax: parseFloat(hargaPerPax),
-        subTotal: parseFloat(subTotal), catatan: catatan || "", createdAt: new Date()
-    };
+// === ADDONS API ===
+
+app.post('/api/addons', async (req, res) => {
     try {
-        const result = await reservationsCollection.updateOne(
-            { _id: new ObjectId(id) },
-            { $push: { addons: newAddon }, $set: { updatedAt: new Date() } }
-        );
-        if (result.matchedCount === 0) return res.status(404).json({ message: `Reservasi tidak ditemukan.` });
-        res.status(201).json({ message: "Add-on berhasil ditambahkan", data: newAddon });
-    } catch (e) { res.status(500).json({ message: "Gagal menambah add-on", error: e.message }); }
+        const { reservationId, item, pax, hargaPerPax, subTotal, catatan } = req.body;
+        if (!ObjectId.isValid(reservationId)) return res.status(400).json({ message: "Invalid Reservation ID" });
+
+        const newAddon = {
+            _id: new ObjectId(),
+            reservationId: new ObjectId(reservationId),
+            item,
+            pax: parseInt(pax),
+            hargaPerPax: parseFloat(hargaPerPax),
+            subTotal: parseFloat(subTotal),
+            catatan: catatan || "",
+            createdAt: new Date()
+        };
+        await addonsCollection.insertOne(newAddon);
+        res.status(201).json({ message: "Addon added successfully", data: newAddon });
+    } catch (e) {
+        res.status(500).json({ message: "Failed to add addon", error: e.message });
+    }
 });
 
-// POST: Menambah pembayaran baru
-app.post('/api/reservations/:id/pembayaran', upload.single('bukti'), async (req, res) => {
-    const { id } = req.params;
-    const { jumlah, tanggal } = req.body;
-    if (!ObjectId.isValid(id)) return res.status(400).json({ message: "ID tidak valid" });
-    if (!jumlah || !tanggal) return res.status(400).json({ message: "Jumlah dan tanggal pembayaran harus diisi." });
+// === PAYMENTS API ===
+
+// Central function to add payment and generate receipt number
+async function addPayment(paymentData) {
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+
+    const pipeline = [
+        { $match: { "nomorKwitansi": { $regex: `^NOTA/${year}/${month}-SDP-` } } },
+        { $sort: { "nomorKwitansi": -1 } },
+        { $limit: 1 }
+    ];
+    const lastPaymentResult = await paymentsCollection.aggregate(pipeline).toArray();
     
+    let nextKwitansiNum = 1;
+    if (lastPaymentResult.length > 0) {
+        const lastNum = parseInt(lastPaymentResult[0].nomorKwitansi.split('-').pop());
+        nextKwitansiNum = lastNum + 1;
+    }
+
+    const kwitansiId = String(nextKwitansiNum).padStart(4, '0');
+    paymentData.nomorKwitansi = `NOTA/${year}/${month}-SDP-${kwitansiId}`;
+    paymentData._id = new ObjectId();
+
+    return await paymentsCollection.insertOne(paymentData);
+}
+
+app.post('/api/payments', upload.single('bukti'), async (req, res) => {
     try {
-        const now = new Date();
-        const year = now.getFullYear();
-        const month = String(now.getMonth() + 1).padStart(2, '0');
-
-        const pipeline = [
-            { $unwind: "$pembayaran" },
-            { $match: { "pembayaran.nomorKwitansi": { $regex: `^NOTA/${year}/${month}-SDP-` } } },
-            { $sort: { "pembayaran.nomorKwitansi": -1 } },
-            { $limit: 1 }
-        ];
-        const lastPaymentResult = await reservationsCollection.aggregate(pipeline).toArray();
-
-        let nextKwitansiNum = 1;
-        if (lastPaymentResult.length > 0) {
-            const lastKwitansi = lastPaymentResult[0].pembayaran.nomorKwitansi;
-            const lastNum = parseInt(lastKwitansi.split('-').pop());
-            nextKwitansiNum = lastNum + 1;
-        }
-
-        const kwitansiId = String(nextKwitansiNum).padStart(4, '0');
-        const nomorKwitansi = `NOTA/${year}/${month}-SDP-${kwitansiId}`;
+        const { reservationId, jumlah, tanggal } = req.body;
+        if (!ObjectId.isValid(reservationId)) return res.status(400).json({ message: "Invalid Reservation ID" });
 
         const newPayment = {
-            _id: new ObjectId(),
-            nomorKwitansi,
+            reservationId: new ObjectId(reservationId),
             jumlah: parseFloat(jumlah),
             tanggal: new Date(tanggal),
             buktiUrl: req.file ? `/uploads/${req.file.filename}` : '',
             createdAt: new Date()
         };
 
-        const result = await reservationsCollection.updateOne(
-            { _id: new ObjectId(id) },
-            { $push: { pembayaran: newPayment }, $set: { updatedAt: new Date() } }
-        );
-        if (result.matchedCount === 0) return res.status(404).json({ message: `Reservasi tidak ditemukan.` });
-        res.status(201).json({ message: "Pembayaran berhasil ditambahkan", data: newPayment });
-    } catch (e) { res.status(500).json({ message: "Gagal menambah pembayaran", error: e.message }); }
+        const result = await addPayment(newPayment);
+        res.status(201).json({ message: "Payment added successfully", data: result });
+    } catch (e) {
+        res.status(500).json({ message: "Failed to add payment", error: e.message });
+    }
 });
 
-
 app.listen(port, () => {
-    console.log(`Server berjalan di http://localhost:${port}`);
+    console.log(`Server is running on http://localhost:${port}`);
     connectDB();
 });
