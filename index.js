@@ -64,7 +64,8 @@ app.get('/api/reservations', async (req, res) => {
         let matchStage = {};
         if (search) {
             if (searchBy === 'tanggalEvent') {
-                const searchDate = new Date(search);
+                // Pastikan tanggal diformat dengan benar untuk query
+                const searchDate = new Date(`${search}T00:00:00.000Z`);
                 if (!isNaN(searchDate.getTime())) {
                     const startOfDay = new Date(searchDate);
                     startOfDay.setUTCHours(0, 0, 0, 0);
@@ -146,8 +147,9 @@ app.post('/api/reservations', async (req, res) => {
             ...newData,
             nomorInvoice,
             _id: new ObjectId(),
-            tanggalReservasi: new Date(newData.tanggalReservasi),
-            tanggalEvent: new Date(newData.tanggalEvent),
+            // PERUBAHAN: Memastikan tanggal disimpan sebagai UTC-midnight
+            tanggalReservasi: new Date(`${newData.tanggalReservasi}T00:00:00.000Z`),
+            tanggalEvent: new Date(`${newData.tanggalEvent}T00:00:00.000Z`),
             pax: parseInt(newData.pax),
             hargaPerPax: parseFloat(newData.hargaPerPax),
             subTotal: parseFloat(newData.subTotal),
@@ -162,7 +164,7 @@ app.post('/api/reservations', async (req, res) => {
             const dpPayment = {
                 reservationId: reservationData._id,
                 jumlah: reservationData.dp,
-                tanggal: new Date(reservationData.tanggalReservasi),
+                tanggal: new Date(`${newData.tanggalReservasi}T00:00:00.000Z`), // Menggunakan tanggal reservasi
                 buktiUrl: '',
                 createdAt: new Date(),
             };
@@ -260,7 +262,8 @@ app.post('/api/payments', upload.single('bukti'), async (req, res) => {
         const newPayment = {
             reservationId: new ObjectId(reservationId),
             jumlah: parseFloat(jumlah),
-            tanggal: new Date(tanggal),
+            // PERUBAHAN: Memastikan tanggal disimpan sebagai UTC-midnight
+            tanggal: new Date(`${tanggal}T00:00:00.000Z`),
             buktiUrl: req.file ? `/uploads/${req.file.filename}` : '',
             createdAt: new Date()
         };
