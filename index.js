@@ -1,4 +1,4 @@
-// index.js (Dengan Logika Invoice yang Diperbaiki)
+// index.js (Dengan Logika DP Otomatis & Invoice yang Diperbaiki)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -13,16 +13,14 @@ const port = process.env.PORT || 3001;
 const mongoUri = process.env.MONGO_URI;
 const dbName = process.env.DB_NAME || 'venueDB';
 
-// Konfigurasi Multer untuk menyimpan file
+// Konfigurasi Multer
 const storage = multer.diskStorage({
     destination: function (req, file, cb) {
         const uploadPath = path.join(__dirname, 'uploads');
-        // Buat folder jika belum ada
         fs.mkdirSync(uploadPath, { recursive: true });
         cb(null, uploadPath);
     },
     filename: function (req, file, cb) {
-        // Buat nama file unik untuk menghindari tumpang tindih
         const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
         cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
     }
@@ -32,7 +30,7 @@ const upload = multer({ storage: storage });
 // Middleware
 app.use(cors());
 app.use(express.json());
-app.use('/uploads', express.static(path.join(__dirname, 'uploads'))); // Serve file statis
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 if (!mongoUri) {
     console.error("Error: MONGO_URI tidak ditemukan di file .env");
@@ -125,8 +123,6 @@ app.post('/api/reservations', async (req, res) => {
         const year = now.getFullYear();
         const month = String(now.getMonth() + 1).padStart(2, '0');
 
-        // --- LOGIKA BARU UNTUK NOMOR INVOICE ---
-        // 1. Cari invoice terakhir di bulan dan tahun yang sama
         const lastInvoice = await reservationsCollection.findOne(
             { nomorInvoice: { $regex: `^INV/${year}/${month}-VE-` } },
             { sort: { nomorInvoice: -1 } }
@@ -134,14 +130,31 @@ app.post('/api/reservations', async (req, res) => {
 
         let nextIdNumber = 1;
         if (lastInvoice) {
-            // 2. Ambil nomor urut dari invoice terakhir dan tambah 1
             const lastId = parseInt(lastInvoice.nomorInvoice.split('-').pop());
             nextIdNumber = lastId + 1;
         }
         
-        // 3. Format nomor urut menjadi 4 digit (e.g., 0001, 0014)
         const nextId = String(nextIdNumber).padStart(4, '0');
         const nomorInvoice = `INV/${year}/${month}-VE-${nextId}`;
+
+        const dpAmount = parseFloat(newData.dp) || 0;
+        const initialPayments = [];
+
+        // --- LOGIKA BARU UNTUK DP OTOMATIS ---
+        if (dpAmount > 0) {
+            const kwitansiCount = 1;
+            const kwitansiId = String(kwitansiCount).padStart(4, '0');
+            const nomorKwitansi = `NOTA/${year}/${month}-SDP-${kwitansiId}`;
+
+            initialPayments.push({
+                _id: new ObjectId(),
+                nomorKwitansi: nomorKwitansi,
+                jumlah: dpAmount,
+                tanggal: new Date(newData.tanggalReservasi), // Asumsi tanggal DP = tanggal reservasi
+                buktiUrl: '', // Kosong karena ini otomatis
+                createdAt: new Date()
+            });
+        }
         // --- AKHIR LOGIKA BARU ---
 
         const reservation = {
@@ -153,9 +166,9 @@ app.post('/api/reservations', async (req, res) => {
             pax: parseInt(newData.pax),
             hargaPerPax: parseFloat(newData.hargaPerPax),
             subTotal: parseFloat(newData.subTotal),
-            dp: parseFloat(newData.dp),
+            dp: dpAmount,
             dibatalkan: false,
-            pembayaran: [],
+            pembayaran: initialPayments, // Masukkan data DP ke riwayat pembayaran
             addons: [],
             createdAt: new Date(),
             updatedAt: new Date(),
